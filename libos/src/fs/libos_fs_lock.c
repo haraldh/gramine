@@ -45,7 +45,8 @@ struct posix_lock_request {
     LIST_TYPE(posix_lock_request) list;
 };
 
-/* Describes file lock details for a given dentry. Currently holds only POSIX locks. */
+/* Describes file lock details for a given dentry. Currently holds both POSIX and BSD (flock) locks,
+ * but for historic reasons has the prefix `posix_` in some fields. */
 DEFINE_LISTP(fs_lock);
 DEFINE_LIST(fs_lock);
 struct fs_lock {
@@ -122,6 +123,11 @@ static void posix_lock_dump(struct fs_lock* fs_lock) {
         } else {
             buf_printf(&buf, " %c[%lu..%lu]", c, pl->start, pl->end);
         }
+        if (pl->handle_id == 0) {
+            buf_printf(&buf, " posix lock");
+        } else {
+            buf_printf(&buf, " flock[id=%lu]", pl->handle_id);
+        }
     }
     if (LISTP_EMPTY(&fs_lock->posix_locks)) {
         buf_printf(&buf, "no locks");
@@ -146,18 +152,29 @@ static void fs_lock_gc(struct fs_lock* fs_lock) {
 }
 
 /*
- * Find first lock that conflicts with `pl`. Two locks conflict if they have different PIDs, their
- * ranges overlap, and at least one of them is a write lock.
+ * Find first lock that conflicts with `pl`. For `fcntl` case (pl->handle_id == 0), two locks
+ * conflict if they have different PIDs, their ranges overlap, and at least one of them is a
+ * write lock. For `flock` case, two locks conflict if they have different handle IDs and at
+ * least one of them is a write lock.
  */
 static struct posix_lock* posix_lock_find_conflict(struct fs_lock* fs_lock, struct posix_lock* pl) {
     assert(locked(&g_fs_lock_lock));
     assert(pl->type != F_UNLCK);
 
     struct posix_lock* cur;
-    LISTP_FOR_EACH_ENTRY(cur, &fs_lock->posix_locks, list) {
-        if (cur->pid != pl->pid && pl->start <= cur->end && cur->start <= pl->end
-               && (cur->type == F_WRLCK || pl->type == F_WRLCK))
-            return cur;
+    /* Gramine doesn't support mixing POSIX and flock types of locks, and assumes that the
+     * application won't ever mix them, otherwise it may exhibit unexpected behavior. */
+    if (pl->handle_id == 0) {
+        LISTP_FOR_EACH_ENTRY(cur, &fs_lock->posix_locks, list) {
+            if (cur->pid != pl->pid && pl->start <= cur->end && cur->start <= pl->end
+                    && (cur->type == F_WRLCK || pl->type == F_WRLCK))
+                return cur;
+        }
+    } else {
+        LISTP_FOR_EACH_ENTRY(cur, &fs_lock->posix_locks, list) {
+            if (cur->handle_id != pl->handle_id && (cur->type == F_WRLCK || pl->type == F_WRLCK))
+                return cur;
+        }
     }
     return NULL;
 }
@@ -180,6 +197,26 @@ static int posix_lock_add_request(struct fs_lock* fs_lock, struct posix_lock* pl
     return 0;
 }
 
+bool has_flock_locks(struct libos_dentry* dent) {
+    lock(&g_fs_lock_lock);
+    if (!dent->fs_lock) {
+        unlock(&g_fs_lock_lock);
+        return false;
+    }
+
+    bool has_flock = false;
+    struct fs_lock* fs_lock = dent->fs_lock;
+    struct posix_lock* cur;
+    LISTP_FOR_EACH_ENTRY(cur, &fs_lock->posix_locks, list) {
+        if (cur->handle_id != 0) {
+            has_flock = true;
+            break;
+        }
+    }
+    unlock(&g_fs_lock_lock);
+    return has_flock;
+}
+
 /*
  * Main part of `posix_lock_set`. Adds/removes a lock (depending on `pl->type`), assumes we already
  * verified there are no conflicts. Replaces existing locks for a given PID, and merges adjacent
@@ -189,7 +226,7 @@ static int posix_lock_add_request(struct fs_lock* fs_lock, struct posix_lock* pl
  */
 static int _posix_lock_set(struct fs_lock* fs_lock, struct posix_lock* pl) {
     assert(locked(&g_fs_lock_lock));
-
+    assert(pl->handle_id == 0);
     /* Preallocate new locks first, so that we don't fail after modifying something. */
 
     /* Lock to be added. Not necessary for F_UNLCK, because we're only removing existing locks. */
@@ -319,11 +356,11 @@ static int _posix_lock_set(struct fs_lock* fs_lock, struct posix_lock* pl) {
     if (new) {
         assert(pl->type != F_UNLCK);
 
-
         new->type = pl->type;
         new->start = start;
         new->end = end;
         new->pid = pl->pid;
+        new->handle_id = 0;
 
 #ifdef DEBUG
         /* Assert that list order is preserved */
@@ -347,6 +384,44 @@ static int _posix_lock_set(struct fs_lock* fs_lock, struct posix_lock* pl) {
     return 0;
 }
 
+static int _flock_lock_set(struct fs_lock* fs_lock, struct posix_lock* pl) {
+    assert(locked(&g_fs_lock_lock));
+    assert(pl->handle_id);
+
+    /* Lock to be added. Not necessary for F_UNLCK, because we're only removing existing locks. */
+    struct posix_lock* new = NULL;
+    if (pl->type != F_UNLCK) {
+        new = malloc(sizeof(*new));
+        if (!new)
+            return -ENOMEM;
+    }
+
+    struct posix_lock* cur;
+    struct posix_lock* tmp;
+    LISTP_FOR_EACH_ENTRY_SAFE(cur, tmp, &fs_lock->posix_locks, list) {
+        if (cur->handle_id == pl->handle_id) {
+            LISTP_DEL(cur, &fs_lock->posix_locks, list);
+            free(cur);
+            break;
+        }
+    }
+
+    if (new) {
+        assert(pl->type != F_UNLCK);
+        new->type = pl->type;
+        /* Lock the whole file; start, end and pid fields are set only for sanity
+         * (not used by flock). */
+        new->start = 0;
+        new->end = FS_LOCK_EOF;
+        new->pid = pl->pid;
+        new->handle_id = pl->handle_id;
+
+        LISTP_ADD(new, &fs_lock->posix_locks, list);
+    }
+
+    return 0;
+}
+
 /*
  * Process pending requests. This function should be called after any modification to the list of
  * locks, since we might have unblocked a request.
@@ -365,7 +440,8 @@ static void posix_lock_process_requests(struct fs_lock* fs_lock) {
         LISTP_FOR_EACH_ENTRY_SAFE(req, tmp, &fs_lock->posix_lock_requests, list) {
             struct posix_lock* conflict = posix_lock_find_conflict(fs_lock, &req->pl);
             if (!conflict) {
-                int result = _posix_lock_set(fs_lock, &req->pl);
+                int result = req->pl.handle_id == 0 ? _posix_lock_set(fs_lock, &req->pl)
+                                                    : _flock_lock_set(fs_lock, &req->pl);
                 LISTP_DEL(req, &fs_lock->posix_lock_requests, list);
 
                 /* Notify the waiter that we processed their request. Note that the result might
@@ -425,7 +501,8 @@ static int posix_lock_set_or_add_request(struct libos_dentry* dent, struct posix
 
         *out_req = req;
     } else {
-        ret = _posix_lock_set(fs_lock, pl);
+        ret = pl->handle_id == 0 ? _posix_lock_set(fs_lock, pl)
+                                 : _flock_lock_set(fs_lock, pl);
         if (ret < 0)
             goto out;
         posix_lock_process_requests(fs_lock);
