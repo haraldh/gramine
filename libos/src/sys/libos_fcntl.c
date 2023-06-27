@@ -288,7 +288,7 @@ long libos_syscall_flock(int fd, unsigned int cmd) {
     struct libos_handle_map* handle_map = get_thread_handle_map(NULL);
     assert(handle_map);
 
-    struct libos_handle* hdl = get_fd_handle(fd, NULL, handle_map);
+    struct libos_handle* hdl = get_fd_handle(fd, NULL, NULL);
     if (!hdl)
         return -EBADF;
 
